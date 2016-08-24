@@ -15,4 +15,8 @@ Prints out status to stderr every 100k lines.
 
  - Nearly everything else
 
+### Alternatives
 
+ - `rdiff` works, but the output is really hard to work with, and it's somehow even slower than this naive tool
+ - `cmp` doesn't give enough information and requires a lot of scripting to actually find useful information
+ - `diff`, even with `--speed-large-files`, puts the entire file in RAM. lame.
