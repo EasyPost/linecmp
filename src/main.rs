@@ -4,10 +4,11 @@ use std::env;
 use std::process::exit;
 use std::io::{Write,BufRead,BufReader};
 use std::fs::File;
-
+use std::sync::mpsc::sync_channel;
+use std::thread;
 
 use itertools::Itertools;
-use itertools::EitherOrBoth::{Both, Right, Left};
+use itertools::EitherOrBoth::{self, Both, Right, Left};
 
 
 macro_rules! println_stderr(
@@ -44,11 +45,13 @@ enum DiffItem {
 }
 
 const MAX_BATCH_SIZE: usize = 100;
+const READ_CHUNK_SIZE: usize = 1000;
+const READ_BUF_SIZE: usize = 524288;
 
 
 fn open(path: &str) -> BufReader<File> {
     BufReader::with_capacity(
-        524288,
+        READ_BUF_SIZE,
         File::open(
             path
         ).expect(&format!("Could not open {:?}", path))
@@ -65,17 +68,37 @@ pub fn main_i() -> i32 {
         return 2;
     }
 
-    let file1 = open(&args[1]);
-    let file2 = open(&args[2]);
+    let (lines_tx, lines_rx) = sync_channel(100);
 
-    let differences = file1.lines().zip_longest(file2.lines()).enumerate().filter_map( |(i, zr)| {
+    let source_handle = thread::spawn ( move|| {
+        // Read the files (and find newlines) in a separate thread
+        let file1 = open(&args[1]);
+        let file2 = open(&args[2]);
+
+        // Chunk up unprocessed lines and send them over a channel to the main thread
+        for chunk in &file1.lines().zip_longest(file2.lines()).enumerate().chunks_lazy(READ_CHUNK_SIZE) {
+            // TODO: Why is every item in .lines() a result? Just unwrap them for now, but maybe do
+            // something saner later?
+            let items: Vec<(usize, EitherOrBoth<String, String>)> = chunk.into_iter().map( |(l,it)| {
+                (l, match it {
+                    Both(l, r) => Both(l.unwrap(), r.unwrap()),
+                    Left(l) => Left(l.unwrap()),
+                    Right(r) => Right(r.unwrap())
+                })
+            }).collect();
+            lines_tx.send(items).unwrap();
+        }
+    });
+
+    // Walk through the lines and pull out those that don't match, creating an iterator
+    // of Differences (wrapped up in DiffItem enums, with some DiffItem::NoDifference heartbeats
+    // interspersed
+    let differences = lines_rx.iter().flatten().filter_map(|(i, zr)| {
         if i % 100000 == 0 {
             println_stderr!("# {}", i);
         }
         match zr {
-            Both(l, r) => {
-                let lhs = l.unwrap();
-                let rhs = r.unwrap();
+            Both(lhs, rhs) => {
                 if lhs != rhs {
                     Some(DiffItem::Difference(Difference::new(i, Some(lhs.to_owned()), Some(rhs.to_owned()))))
                 } else {
@@ -90,10 +113,10 @@ pub fn main_i() -> i32 {
                 }
             },
             Left(l) => {
-                Some(DiffItem::Difference(Difference::new(i, Some(l.unwrap()), None)))
+                Some(DiffItem::Difference(Difference::new(i, Some(l), None)))
             },
             Right(r) => {
-                Some(DiffItem::Difference(Difference::new(i, None, Some(r.unwrap()))))
+                Some(DiffItem::Difference(Difference::new(i, None, Some(r))))
             }
         }
     });
@@ -151,6 +174,8 @@ pub fn main_i() -> i32 {
             }
         }
     }
+
+    source_handle.join().unwrap();
 
     return 0;
 }
