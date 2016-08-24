@@ -5,6 +5,7 @@ use std::process::exit;
 use std::io::{Write,BufRead,BufReader};
 use std::fs::File;
 
+
 use itertools::Itertools;
 use itertools::EitherOrBoth::{Both, Right, Left};
 
@@ -37,7 +38,22 @@ impl Difference {
     }
 }
 
+enum DiffItem {
+    Difference(Difference),
+    NoDifference
+}
+
 const MAX_BATCH_SIZE: usize = 100;
+
+
+fn open(path: &str) -> BufReader<File> {
+    BufReader::with_capacity(
+        524288,
+        File::open(
+            path
+        ).expect(&format!("Could not open {:?}", path))
+    )
+}
 
 
 pub fn main_i() -> i32 {
@@ -49,8 +65,8 @@ pub fn main_i() -> i32 {
         return 2;
     }
 
-    let file1 = BufReader::new(File::open(args[1].clone()).expect(&format!("Could not open {:?}", args[1])));
-    let file2 = BufReader::new(File::open(args[2].clone()).expect(&format!("Could not open {:?}", args[2])));
+    let file1 = open(&args[1]);
+    let file2 = open(&args[2]);
 
     let differences = file1.lines().zip_longest(file2.lines()).enumerate().filter_map( |(i, zr)| {
         if i % 100000 == 0 {
@@ -61,16 +77,23 @@ pub fn main_i() -> i32 {
                 let lhs = l.unwrap();
                 let rhs = r.unwrap();
                 if lhs != rhs {
-                    Some(Difference::new(i, Some(lhs.to_owned()), Some(rhs.to_owned())))
+                    Some(DiffItem::Difference(Difference::new(i, Some(lhs.to_owned()), Some(rhs.to_owned()))))
                 } else {
-                    None
+                    if i % 10000 == 0 {
+                        // emit a NoDifference chunk every few thousand lines to prevent it.peek()
+                        // from blocking for a really long time in between differences
+                        Some(DiffItem::NoDifference)
+                    } else {
+                        // Most of the time, though, just have filter_map elide those
+                        None
+                    }
                 }
             },
             Left(l) => {
-                Some(Difference::new(i, Some(l.unwrap()), None))
+                Some(DiffItem::Difference(Difference::new(i, Some(l.unwrap()), None)))
             },
             Right(r) => {
-                Some(Difference::new(i, None, Some(r.unwrap())))
+                Some(DiffItem::Difference(Difference::new(i, None, Some(r.unwrap()))))
             }
         }
     });
@@ -78,32 +101,37 @@ pub fn main_i() -> i32 {
     // Group the diffs into batches of consecutive lines
     let difference_batches = differences.peekable().batching(|it| {
         let mut resp = vec!();
-        match it.next() {
-            None => None,
-            Some(first) => {
-                let first_line = first.line;
-                let mut cur_line = first.line;
-                resp.push(first);
-                while resp.len() < MAX_BATCH_SIZE {
-                    // it would be clearer here if we could call the it.next() inside the
-                    // it.peek(), but the borrow checker disallows it, so we break instead
-                    //
-                    // NOTE: it.peek() will appear to block until the next diff item, and we will
-                    // just be sitting here holding the bag on the current item. We could probably
-                    // work around that by having the differences iterator generator above emit
-                    // a sigil every once in a while saying that it hasn't found any differences.
-                    if let Some(ref diff) = it.peek() {
-                        if diff.line != cur_line + 1 {
-                            break;
+        loop {
+            match it.next() {
+                None => { return None; },
+                Some(DiffItem::NoDifference) => { continue },
+                Some(DiffItem::Difference(first)) => {
+                    let first_line = first.line;
+                    let mut cur_line = first.line;
+                    resp.push(first);
+                    while resp.len() < MAX_BATCH_SIZE {
+                        // it would be clearer here if we could call the it.next() inside the
+                        // it.peek(), but the borrow checker disallows it, so we break instead
+                        match it.peek() {
+                            Some(&DiffItem::NoDifference) => {
+                                break;
+                            }
+                            Some(&DiffItem::Difference(ref diff)) => {
+                                if diff.line != cur_line + 1 {
+                                    break;
+                                }
+                            },
+                            None => {
+                                break;
+                            }
+                        };
+                        if let DiffItem::Difference(next_line) = it.next().unwrap() {
+                            cur_line  = next_line.line;
+                            resp.push(next_line);
                         }
-                    } else {
-                        break;
                     }
-                    let next_line = it.next().unwrap();
-                    cur_line  = next_line.line;
-                    resp.push(next_line);
+                    return Some((first_line, resp));
                 }
-                Some((first_line, resp))
             }
         }
     });
