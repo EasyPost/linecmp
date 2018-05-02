@@ -1,23 +1,15 @@
-#[macro_use] extern crate itertools;
+extern crate itertools;
+extern crate clap;
 
-use std::env;
 use std::process::exit;
-use std::io::{Write,BufRead,BufReader};
+use std::io::{self,BufRead,BufReader,Write};
 use std::fs::File;
-
+use std::fmt;
+use std::error::Error;
 
 use itertools::Itertools;
 use itertools::EitherOrBoth::{Both, Right, Left};
-
-
-macro_rules! println_stderr(
-    ($($arg:tt)*) => (
-        match writeln!(&mut ::std::io::stderr(), $($arg)* ) {
-            Ok(_) => {},
-            Err(x) => panic!("Unable to write to stderr: {}", x),
-        }
-    )
-);
+use clap::Arg;
 
 
 #[derive(Debug)]
@@ -32,8 +24,8 @@ impl Difference {
     fn new(i: usize, lhs: Option<String>, rhs: Option<String>) -> Self {
         Difference {
             line: i + 1,
-            lhs: lhs,
-            rhs: rhs
+            lhs,
+            rhs
         }
     }
 }
@@ -46,31 +38,90 @@ enum DiffItem {
 const MAX_BATCH_SIZE: usize = 100;
 
 
-fn open(path: &str) -> BufReader<File> {
-    BufReader::with_capacity(
-        524288,
-        File::open(
-            path
-        ).expect(&format!("Could not open {:?}", path))
-    )
+#[derive(Debug)]
+enum MainError {
+    FileOpenError { filename: String, error: io::Error },
+    WriteError(io::Error),
+}
+
+impl fmt::Display for MainError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            MainError::FileOpenError { ref filename, ref error } => {
+                write!(f, "Error opening {}: {}", filename, error)
+            }
+            _ => <Self as fmt::Debug>::fmt(self, f)
+        }
+    }
 }
 
 
-pub fn main_i() -> i32 {
-    let args: Vec<String> = env::args().collect();
-    let program = args[0].clone();
-
-    if args.len() != 3 {
-        println_stderr!("Usage: {} file1 file2", program);
-        return 2;
+impl Error for MainError {
+    fn description(&self) -> &'static str {
+        "error"
     }
 
-    let file1 = open(&args[1]);
-    let file2 = open(&args[2]);
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            MainError::FileOpenError { error: ref e, .. } => Some(e),
+            MainError::WriteError(ref e) => Some(e),
+        }
+    }
+}
+
+
+fn open(path: &str) -> Result<BufReader<File>, io::Error> {
+    Ok(BufReader::with_capacity(
+        1 << 19,
+        File::open(
+            path
+        )?
+    ))
+}
+
+
+fn write_difference_batches<W, I>(mut target: W, difference_batches: I) -> Result<(), io::Error>
+    where W: Write, I: Iterator<Item=(usize, Vec<Difference>)> {
+    for (first_line, diff) in difference_batches {
+        writeln!(target, "line {}", first_line)?;
+        for di in &diff {
+            match di.lhs {
+                Some(ref l) => writeln!(target, "< {}", l)?,
+                None => writeln!(target, "< [missing]")?,
+            };
+        }
+        for di in diff {
+            match di.rhs {
+                Some(ref l) => writeln!(target, "> {}", l)?,
+                None => writeln!(target, "> [missing]")?,
+            };
+        }
+    }
+    Ok(())
+}
+
+
+fn main_i() -> Result<i32, MainError> {
+    let matches = clap::App::new(env!("CARGO_PKG_NAME"))
+                            .version(env!("CARGO_PKG_VERSION"))
+                            .author("EasyPost <oss@easypost.com>")
+                            .about(env!("CARGO_PKG_DESCRIPTION"))
+                            .arg(Arg::with_name("file1")
+                                     .required(true)
+                                     .help("Path to LHS file operand"))
+                            .arg(Arg::with_name("file2")
+                                     .required(true)
+                                     .help("Path to RHS file operand"))
+                            .get_matches();
+
+    let path1 = matches.value_of("file1").unwrap();
+    let path2 = matches.value_of("file2").unwrap();
+    let file1 = open(&path1).map_err(|e| MainError::FileOpenError { filename: path1.to_owned(), error: e })?;
+    let file2 = open(&path2).map_err(|e| MainError::FileOpenError { filename: path2.to_owned(), error: e })?;
 
     let differences = file1.lines().zip_longest(file2.lines()).enumerate().filter_map( |(i, zr)| {
-        if i % 100000 == 0 {
-            println_stderr!("# {}", i);
+        if i % 100_000 == 0 {
+            eprintln!("# {}", i);
         }
         match zr {
             Both(l, r) => {
@@ -78,15 +129,13 @@ pub fn main_i() -> i32 {
                 let rhs = r.unwrap();
                 if lhs != rhs {
                     Some(DiffItem::Difference(Difference::new(i, Some(lhs.to_owned()), Some(rhs.to_owned()))))
+                } else if i % 10000 == 0 {
+                    // emit a NoDifference chunk every few thousand lines to prevent it.peek()
+                    // from blocking for a really long time in between differences
+                    Some(DiffItem::NoDifference)
                 } else {
-                    if i % 10000 == 0 {
-                        // emit a NoDifference chunk every few thousand lines to prevent it.peek()
-                        // from blocking for a really long time in between differences
-                        Some(DiffItem::NoDifference)
-                    } else {
-                        // Most of the time, though, just have filter_map elide those
-                        None
-                    }
+                    // Most of the time, though, just have filter_map elide those
+                    None
                 }
             },
             Left(l) => {
@@ -136,25 +185,18 @@ pub fn main_i() -> i32 {
         }
     });
 
-    for (first_line, diff) in difference_batches {
-        println!("line {}", first_line);
-        for di in diff.iter() {
-            match di.lhs {
-                Some(ref l) => println!("< {}", l),
-                None => println!("< [missing]")
-            }
-        }
-        for di in diff.iter() {
-            match di.rhs {
-                Some(ref l) => println!("> {}", l),
-                None => println!("> [missing]")
-            }
-        }
-    }
+    let stdout = io::stdout();
+    write_difference_batches(stdout.lock(), difference_batches).map_err(MainError::WriteError)?;
 
-    return 0;
+    Ok(0)
 }
 
 pub fn main() {
-    exit(main_i());
+    match main_i() {
+        Ok(i) => exit(i),
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(1);
+        }
+    }
 }
